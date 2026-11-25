@@ -1,0 +1,631 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#10121e">
+<title>ふたりオンライン対戦</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/peerjs/1.5.4/peerjs.min.js"></script>
+<script>
+// PeerJS で claude.ai の room（presence だけ）と同じ形を作る。ホスト＝部屋を作った人。
+window.__peerRoom = {
+  join(name, role) {
+    return new Promise((resolve, reject) => {
+      if (typeof Peer !== "function") { reject({ code: "upstream_error" }); return; }
+      const hostId = "futari-online-" + name;
+      const handlers = [];
+      let myPresence = {};
+      const conns = new Map(); // peer -> {conn, presence}
+      let peer = null, left = false, settled = false, retryTimer = null;
+      const emitPeers = () => {
+        const list = [{ peer: "me", by: null, isMe: true, sameTab: true, kind: "viewer", guest: false, presence: myPresence, updatedAt: Date.now() }];
+        for (const [id, v] of conns) if (v.presence) list.push({ peer: id, by: null, isMe: false, sameTab: false, kind: "viewer", guest: false, presence: v.presence, updatedAt: Date.now() });
+        handlers.forEach(h => { try { h({ peers: list, joined: [], left: [], updated: [] }) } catch (_) {} });
+      };
+      const sendAll = () => { for (const v of conns.values()) { try { if (v.conn.open) v.conn.send({ t: "p", p: myPresence }) } catch (_) {} } };
+      const wire = conn => {
+        conns.set(conn.peer, { conn, presence: null, seen: Date.now() });
+        conn.on("open", () => { try { conn.send({ t: "p", p: myPresence }) } catch (_) {} });
+        conn.on("data", d => {
+          const sv = conns.get(conn.peer); if (sv && sv.conn === conn) sv.seen = Date.now();
+          if (d && d.t === "k") return;
+          if (!d || d.t !== "p" || typeof d.p !== "object" || d.p === null) return;
+          if (JSON.stringify(d.p).length > 8000) return;
+          const v = conns.get(conn.peer); if (v) { v.presence = d.p; emitPeers(); }
+        });
+        const drop = () => { if (conns.get(conn.peer) && conns.get(conn.peer).conn === conn) { conns.delete(conn.peer); emitPeers(); } if (role === "guest" && !left) scheduleGuestConnect(1500); };
+        conn.on("close", drop); conn.on("error", drop);
+      };
+      function scheduleGuestConnect(ms) {
+        clearTimeout(retryTimer);
+        retryTimer = setTimeout(() => {
+          if (left || !peer || peer.destroyed) return;
+          if ([...conns.values()].some(v => v.conn.open)) return;
+          if (peer.disconnected) { try { peer.reconnect() } catch (_) {} }
+          wire(peer.connect(hostId, { reliable: true, serialization: "json" }));
+          scheduleGuestConnect(4000); // つながるまで数秒ごとに試す
+        }, ms);
+      }
+      const api = {
+        name,
+        presence: async patch => { myPresence = Object.assign({}, myPresence, patch); for (const k in patch) if (patch[k] === null) delete myPresence[k]; sendAll(); },
+        onPeers: h => { handlers.push(h); setTimeout(emitPeers, 0); return () => { const i = handlers.indexOf(h); if (i >= 0) handlers.splice(i, 1); }; },
+        emit: async () => {}, on: () => () => {}, peers: () => [], connected: () => !!peer && !peer.disconnected, onConnection: () => () => {},
+        leave: async () => { left = true; clearTimeout(retryTimer); try { peer && peer.destroy() } catch (_) {} }
+      };
+      // 3秒ごとに「いるよ」を送り、10秒聞こえない相手は抜けたことにする
+      const beat = setInterval(() => {
+        if (left) { clearInterval(beat); return; }
+        const now = Date.now();
+        for (const [id, v] of [...conns]) {
+          if (v.conn.open) { try { v.conn.send({ t: "k" }) } catch (_) {} }
+          if (now - v.seen > 10000) { conns.delete(id); try { v.conn.close() } catch (_) {} emitPeers(); if (role === "guest") scheduleGuestConnect(500); }
+        }
+      }, 3000);
+      let tries = 0;
+      const start = () => {
+        peer = role === "host" ? new Peer(hostId, { debug: 0 }) : new Peer({ debug: 0 });
+        peer.on("open", () => {
+          if (!settled) { settled = true; resolve(api); }
+          if (role === "guest") scheduleGuestConnect(0);
+        });
+        peer.on("connection", conn => { if (role === "host") wire(conn); else conn.close(); });
+        peer.on("disconnected", () => { if (!left) setTimeout(() => { try { if (!left && peer.disconnected && !peer.destroyed) peer.reconnect() } catch (_) {} }, 2000); });
+        peer.on("error", err => {
+          const t = err && err.type;
+          if (t === "peer-unavailable") return; // 相手がまだいない（ゲストは再試行が続く）
+          if (t === "unavailable-id" && role === "host") {
+            // 読み込み直した直後は前の自分がまだ名前を持っていることがある
+            try { peer.destroy() } catch (_) {}
+            if (!settled && tries++ < 6) { setTimeout(start, 2500); return; }
+            if (!settled) { settled = true; reject({ code: "in_use" }); }
+            return;
+          }
+          if (!settled) { settled = true; reject({ code: "upstream_error" }); }
+        });
+      };
+      start();
+    });
+  }
+};
+</script>
+</head>
+<body>
+
+<style>
+:root{color-scheme:dark;--bg:#10121e;--panel:#1b1e2d;--panel2:#24283a;--text:#f5f5fa;--muted:#b5b8ca;--red:#ff5a5f;--blue:#3fa7ff;--gold:#ffd166;--green:#70e1a1}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){--bg:#10121e}}
+:root[data-theme="dark"]{--bg:#10121e}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;min-height:100%;background:var(--bg);color:var(--text);font-family:"Hiragino Maru Gothic ProN","BIZ UDPGothic","Yu Gothic UI","Meiryo",sans-serif;overscroll-behavior:none}
+body{min-height:100svh;display:flex;justify-content:center;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none;touch-action:manipulation}
+button,input{font:inherit}
+button{min-height:50px;border:0;border-radius:15px;padding:12px 16px;background:#34394f;color:var(--text);font-weight:800;font-size:17px;cursor:pointer;touch-action:manipulation}
+button:disabled{opacity:.4;cursor:default}
+button.primary{background:linear-gradient(135deg,#8655e8,#5367f1);box-shadow:0 5px 18px #6856d944}
+button.gold{background:var(--gold);color:#211c12}
+button.ghost{background:#292d40}
+button:active:not(:disabled){transform:scale(.98)}
+#app{width:100%;max-width:440px;min-height:100svh;padding:calc(16px + env(safe-area-inset-top)) 16px calc(18px + env(safe-area-inset-bottom));overflow-x:hidden}
+h1,h2,h3,p{margin-top:0}
+h1{font-size:30px;line-height:1.2;margin-bottom:10px}
+h2{font-size:23px;margin-bottom:6px}
+h3{font-size:18px;margin-bottom:8px}
+p{line-height:1.65}
+.screen{min-height:calc(100svh - 34px);display:flex;flex-direction:column;gap:14px}
+.center{justify-content:center;text-align:center}
+.brand{font-size:44px;margin-bottom:4px}
+.sub{color:var(--muted);margin:0}
+.card{background:var(--panel);border:1px solid #ffffff10;border-radius:20px;padding:18px;box-shadow:0 10px 30px #0003}
+.row{display:flex;gap:10px}
+.row>*{flex:1}
+.stack{display:flex;flex-direction:column;gap:10px}
+label{display:block;text-align:left;font-size:14px;color:var(--muted)}
+input.field{width:100%;height:54px;margin-top:6px;border:1px solid #454a61;border-radius:14px;background:#141725;color:var(--text);padding:0 14px;font-size:18px;user-select:text;-webkit-user-select:text}
+input.code{font-size:26px;letter-spacing:.3em;text-align:center}
+.player{font-weight:900}
+.p1{color:var(--red)}.p2{color:var(--blue)}
+.scorebar{position:sticky;top:4px;z-index:2;display:flex;justify-content:space-between;align-items:center;gap:6px;background:#181b29ee;border:1px solid #ffffff14;border-radius:16px;padding:10px 13px;backdrop-filter:blur(8px)}
+.score{font-size:17px;font-weight:900;min-width:0;overflow-wrap:anywhere}.round{font-size:13px;color:var(--muted);text-align:center;flex-shrink:0}
+.you{font-size:11px;font-weight:800;color:var(--text);background:#ffffff1c;border-radius:6px;padding:1px 5px;margin-left:3px;vertical-align:2px}
+.badge{display:inline-block;border-radius:999px;background:#ffffff12;padding:5px 10px;font-size:13px;color:var(--muted)}
+.note{font-size:14px;color:var(--muted);margin:0}
+.grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:7px;width:100%;max-width:390px;margin:0 auto}
+.cell{min-width:0;aspect-ratio:1/1;min-height:48px;padding:0;border-radius:12px;background:#30354a;border:2px solid transparent;font-size:24px;display:flex;align-items:center;justify-content:center;color:var(--text);font-weight:800}
+.cell.row0{background:#3a3243}.cell.goal{background:#24394a}
+.cell.dim{opacity:.32}.cell.selected{border-color:var(--gold);background:#51472a}
+.cell.canmove{box-shadow:inset 0 0 0 2px #70e1a1;background:#234536}
+.cell.path{background:#41405c}.cell.trap{background:#692f3a}
+.cell.ghosttrap{background:#3e2a35;font-size:18px;opacity:.75}
+.gridlabels{max-width:390px;margin:-6px auto 0;color:var(--muted);font-size:12px;text-align:center}
+.quote{border-left:4px solid var(--red);padding:12px 14px;background:#ffffff0b;border-radius:0 14px 14px 0;font-size:18px}
+.quote.bluequote{border-color:var(--blue)}
+.options{display:grid;gap:9px}
+.options button{text-align:left}
+.bank{border:1px solid #ffffff18;border-radius:17px;background:var(--panel);padding:18px;text-align:left;min-height:90px}
+.bank strong{display:block;font-size:23px;margin-bottom:5px}.bank span{color:var(--muted)}
+.resultword{font-size:38px;font-weight:1000;text-align:center;line-height:1.2}
+.win{color:var(--gold)}.lose{color:#ff8790}
+.history{display:flex;flex-direction:column;gap:8px}
+.histrow{background:#ffffff0b;border-radius:12px;padding:10px 12px;font-size:14px;line-height:1.5}
+.wait{display:flex;flex-direction:column;align-items:center;gap:8px;text-align:center;padding:22px 18px}
+.wait .big{font-size:44px}
+.dots::after{content:"";display:inline-block;width:1.5em;text-align:left;animation:dots 1.2s steps(4) infinite}
+@keyframes dots{0%{content:""}25%{content:"・"}50%{content:"・・"}75%{content:"・・・"}}
+.bigcode{font-size:52px;font-weight:1000;letter-spacing:.18em;color:var(--gold);margin:4px 0}
+.banner{background:#4a3418;border:1px solid #ffd16655;color:#ffe3a3;border-radius:14px;padding:10px 12px;font-size:14px;text-align:center}
+.banner.info{background:#1d2c44;border-color:#3fa7ff55;color:#cfe6ff}
+.turnflag{border-radius:14px;padding:10px 12px;text-align:center;font-weight:900;font-size:17px}
+.turnflag.mine{background:#1f4a33;color:#bff5d5;box-shadow:0 0 0 2px #70e1a155}
+.turnflag.theirs{background:#24283a;color:var(--muted)}
+.status{font-size:12px;color:var(--muted);text-align:center}
+.shake{animation:shake .4s ease-in-out 2}
+.flash{animation:flash .5s ease-in-out 2}
+@keyframes shake{20%{transform:translateX(-8px)}40%{transform:translateX(8px)}60%{transform:translateX(-5px)}80%{transform:translateX(5px)}}
+@keyframes flash{50%{box-shadow:inset 0 0 0 999px #ff263955}}
+.small{font-size:13px;color:var(--muted)}
+.spacer{flex:1}
+@media(max-height:700px){.screen{gap:10px}.card{padding:14px}.cell{min-height:42px}}
+</style>
+<main id="app" aria-live="polite"></main>
+<script>
+(()=>{
+"use strict";
+const quotes=["真ん中は安全だよ","左はやめといた方がいい","右はやめといた方がいい","今回はやさしくしといた","まっすぐ行けば勝てる","ななめは危ない","最後の段が本番","全部ウソかもね","何も言わない"];
+const banks=[{id:"small",name:"小",points:1},{id:"middle",name:"中",points:2},{id:"large",name:"大",points:3}];
+const ANYONE=["chooseGame","start","replay","select","aFinish","aNext","aSudden","bNext","bSudden"];
+const app=document.getElementById("app");
+const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const N=v=>{const n=Number(v);return Number.isFinite(n)?n:0};
+const arr=v=>Array.isArray(v)?v:[];
+const rid=()=>Math.random().toString(36).slice(2,10);
+const cleanName=s=>String(s??"").replace(/[\u0000-\u001f\u007f-\u009f​-‏‪-‮⁠-⁯﻿]/g,"").trim().slice(0,16);
+const bankName=id=>(banks.find(b=>b.id===id)||{}).name||"";
+const declLabel=id=>id==="silent"?"言わない":`${bankName(id)}を狙う`;
+function ss(k,v){try{if(v===undefined)return JSON.parse(sessionStorage.getItem(k)||"null");if(v===null)sessionStorage.removeItem(k);else sessionStorage.setItem(k,JSON.stringify(v))}catch(_){return null}}
+
+/* ---------- 共有する状態（部屋を作った人＝ホストが持つ） ---------- */
+function freshA(){return {completed:0,traps:[],quote:null,path:[],marks:[],stones:2,stoneMode:false,earned:0,finishedBy:"",sudden:false,sdProgress:0,sdBase:[0,0],phase:"setup"}}
+function freshB(){return {turn:0,actual:null,declaration:"silent",history:[[],[]],pending:null,sudden:false,sdProgress:0,sdBase:[0,0],phase:"choose"}}
+function newShared(){return {v:1,ver:0,screen:"select",game:null,names:["",""],scores:[0,0],a:freshA(),b:freshB(),fx:{n:0,k:""},guestGid:"",guestApplied:0}}
+
+/* ---------- この画面だけの状態 ---------- */
+const L={view:"lobby",role:null,code:"",gid:rid(),name:"",joinCode:"",inputs:[],n:0,roomNs:null,roomState:"loading",r:null,unsubs:[],hostPeer:null,guestPeer:null,spectator:false,lastFx:-1,err:"",hostLostAt:0};
+let S=null;   // 共有状態
+let me=-1;    // 0=ホスト(赤) 1=ゲスト(青) -1=観戦
+let audioCtx=null;
+
+function sound(freq=520,duration=.08){
+ try{if(!audioCtx)audioCtx=new(window.AudioContext||window.webkitAudioContext)();else if(audioCtx.state==="suspended")audioCtx.resume();
+ const o=audioCtx.createOscillator(),g=audioCtx.createGain();o.frequency.value=freq;o.type="sine";g.gain.setValueAtTime(.08,audioCtx.currentTime);g.gain.exponentialRampToValueAtTime(.001,audioCtx.currentTime+duration);o.connect(g);g.connect(audioCtx.destination);o.start();o.stop(audioCtx.currentTime+duration)}catch(_){}
+}
+function buzz(ms=25){try{if(navigator.vibrate)navigator.vibrate(ms)}catch(_){}}
+function playFx(k){
+ const m={step:[520,.08,0],boom:[100,.3,90],goal:[850,.2,45],stoneTrap:[180,.12,30],stoneSafe:[620,.08,15],handoff:[700,.1,20],caught:[260,.25,60],stolen:[900,.18,30]}[k];
+ if(m){sound(m[0],m[1]);if(m[2])buzz(m[2])}
+}
+
+/* ---------- 共通の見た目 ---------- */
+const name=i=>cleanName(S&&S.names[i])||`プレイヤー${i+1}`;
+const colorClass=i=>i===0?"p1":"p2";
+const youTag=i=>i===me?`<span class="you">あなた</span>`:"";
+function scorebar(label){return `<div class="scorebar"><div class="score p1">${esc(name(0))}${youTag(0)} <b>${N(S.scores[0])}</b></div><div class="round">${esc(label)}</div><div class="score p2" style="text-align:right">${esc(name(1))}${youTag(1)} <b>${N(S.scores[1])}</b></div></div>`}
+function button(label,act,cls="",extra=""){return `<button class="${cls}" data-act="${act}" ${extra}>${esc(label)}</button>`}
+function page(body,cls=""){return `<section class="screen ${cls}">${banners()}${body}</section>`}
+function waitCard(icon,text){return `<div class="card wait"><div class="big">${icon}</div><p style="margin:0"><span class="dots">${text}</span></p></div>`}
+function turnFlag(mine,text){return `<div class="turnflag ${mine?"mine":"theirs"}">${text}</div>`}
+function banners(){
+ let h="";
+ if(L.view!=="game")return h;
+ if(L.spectator)h+=`<div class="banner info">この部屋は2人そろっているので、観戦中です</div>`;
+ else if(L.role==="host"&&!L.guestPeer&&S&&S.guestGid)h+=`<div class="banner">${esc(name(1))}さんの接続が切れました。戻ってくるのを待っています</div>`;
+ else if(L.role==="guest"&&L.hostLostAt)h+=`<div class="banner">${esc(name(0))}さんの接続が切れました。戻ってくるのを待っています</div>`;
+ return h;
+}
+
+/* ---------- ゲームの決まり（ホストだけが実行） ---------- */
+function trapper(){const a=S.a;return (N(a.completed)-(a.finishedBy?1:0))%2}
+function walker(){return 1-trapper()}
+function adjacent(x,y){return arr(S.a.traps).some(t=>Math.abs(t.x-x)<=1&&Math.abs(t.y-y)<=1)}
+function winner(){return S.scores[0]===S.scores[1]?-1:S.scores[0]>S.scores[1]?0:1}
+function fx(k){S.fx={n:N(S.fx.n)+1,k}}
+function setupARound(){Object.assign(S.a,{traps:[],quote:null,path:[],marks:[],stones:2,stoneMode:false,earned:0,finishedBy:"",phase:"setup"});S.screen="A"}
+function finishA(kind){
+ const a=S.a;if(a.finishedBy)return;
+ const w=walker();
+ if(kind==="goal")a.earned=8;
+ S.scores[w]+=a.earned;a.finishedBy=kind;a.completed++;
+}
+function advanceA(){
+ const a=S.a;
+ if(a.sudden){
+  a.sdProgress++;
+  if(a.sdProgress<2){setupARound();return}
+  const p=[S.scores[0]-a.sdBase[0],S.scores[1]-a.sdBase[1]];
+  if(p[0]!==p[1])a.phase="final";else{a.sdBase=[...S.scores];a.sdProgress=0;a.phase="sudden"}
+  return;
+ }
+ if(a.completed<6){setupARound();return}
+ a.phase=S.scores[0]===S.scores[1]?"sudden":"final";
+}
+function canDo(seat,n){
+ if(seat!==0&&seat!==1)return false;
+ const a=S.a,b=S.b,inA=S.screen==="A",inB=S.screen==="B";
+ switch(n){
+  case"cell":case"trapsDone":return inA&&a.phase==="setup"&&seat===trapper();
+  case"quote":case"quoteDone":return inA&&a.phase==="quote"&&seat===trapper();
+  case"stone":case"stoneCancel":case"walkCell":return inA&&a.phase==="walk"&&!a.finishedBy&&seat===walker();
+  case"aFinish":return inA&&a.phase==="walk"&&!!a.finishedBy;
+  case"aNext":return inA&&a.phase==="result";
+  case"aSudden":return inA&&a.phase==="sudden";
+  case"bank":return inB&&b.phase==="choose"&&seat===b.turn%2;
+  case"declare":case"bDeclareDone":return inB&&b.phase==="declare"&&seat===b.turn%2;
+  case"guard":return inB&&b.phase==="guard"&&seat===1-b.turn%2;
+  case"bNext":return inB&&b.phase==="result";
+  case"bSudden":return inB&&b.phase==="final"&&winner()<0;
+  case"chooseGame":return S.screen==="select";
+  case"start":return S.screen==="rules";
+  case"replay":return (inA&&a.phase==="final")||(inB&&b.phase==="final");
+  case"select":return S.screen==="rules"||(inA&&(a.phase==="final"||a.phase==="sudden"))||(inB&&b.phase==="final");
+ }
+ return false;
+}
+function doAct(seat,n,x,y){
+ const a=S.a,b=S.b;
+ switch(n){
+ case"chooseGame":if(x==="A"||x==="B"){S.game=x;S.screen="rules"}break;
+ case"select":S.screen="select";break;
+ case"start":case"replay":S.scores=[0,0];S.a=freshA();S.b=freshB();S.screen=S.game==="A"?"A":"B";break;
+ case"cell":{
+  x=N(x);y=N(y);if(x<0||x>4)break;
+  const idx=a.traps.findIndex(t=>t.x===x&&t.y===y);
+  if(idx>=0)a.traps.splice(idx,1);
+  else if(y>=1&&y<=5&&a.traps.length<4&&!a.traps.some(t=>t.y===y)&&!adjacent(x,y))a.traps.push({x,y});
+  break}
+ case"trapsDone":if(a.traps.length===4){a.phase="quote";a.quote=null}break;
+ case"quote":{const i=N(x);if(i>=0&&i<quotes.length&&Number.isInteger(i))a.quote=i;break}
+ case"quoteDone":if(a.quote!==null){a.phase="walk";fx("handoff")}break;
+ case"stone":if(a.stones>0)a.stoneMode=!a.stoneMode;break;
+ case"stoneCancel":a.stoneMode=false;break;
+ case"walkCell":{
+  x=N(x);y=N(y);if(x<0||x>4||y<0||y>5)break;
+  const path=a.path,at=path[path.length-1];
+  if(a.stoneMode){
+   if(a.stones>0&&y>=1&&!path.some(p=>p.y===y)&&!a.marks.some(m=>m.x===x&&m.y===y)){
+    const trap=a.traps.some(t=>t.x===x&&t.y===y);a.marks.push({x,y,trap});a.stones--;a.stoneMode=false;fx(trap?"stoneTrap":"stoneSafe");
+   }break;
+  }
+  if(!at&&y===0){path.push({x,y});fx("step");break}
+  if(at&&y===at.y+1&&Math.abs(x-at.x)<=1){
+   path.push({x,y});const trap=a.traps.some(t=>t.x===x&&t.y===y);
+   if(trap){finishA("trap");fx("boom")}
+   else if(y===5){finishA("goal");fx("goal")}
+   else{a.earned++;fx("step")}
+  }break}
+ case"aFinish":a.phase="result";break;
+ case"aNext":advanceA();break;
+ case"aSudden":a.sudden=true;a.sdProgress=0;a.sdBase=[...S.scores];setupARound();break;
+ case"bank":if(banks.some(k=>k.id===x)){b.actual=x;b.phase="declare";b.declaration="silent"}break;
+ case"declare":if(["small","middle","large","silent"].includes(x))b.declaration=x;break;
+ case"bDeclareDone":if(b.actual){b.phase="guard";fx("handoff")}break;
+ case"guard":{
+  const actual=banks.find(k=>k.id===b.actual),gb=banks.find(k=>k.id===x);if(!actual||!gb)break;
+  const thief=b.turn%2,guard=1-thief,caught=x===b.actual,penalty=b.declaration!=="silent"&&b.declaration!==b.actual;
+  b.pending={thief,guard,caught,actual:actual.id,guarded:gb.id,points:actual.points,penalty};
+  if(caught)S.scores[guard]+=actual.points;else S.scores[thief]+=actual.points;
+  if(penalty)S.scores[thief]-=1;
+  b.phase="wait";
+  const turnAt=b.turn;
+  setTimeout(()=>{if(S&&S.screen==="B"&&S.b.phase==="wait"&&S.b.turn===turnAt){S.b.phase="result";fx(S.b.pending&&S.b.pending.caught?"caught":"stolen");S.ver++;publish()}},800);
+  break}
+ case"bNext":{
+  const r=b.pending;if(!r)break;
+  b.history[r.thief].push([b.declaration,r.actual,r.caught?1:0,r.penalty?1:0]);
+  if(b.history[r.thief].length>20)b.history[r.thief].shift();
+  b.pending=null;b.turn++;
+  if(b.sudden){
+   b.sdProgress++;
+   if(b.sdProgress>=2){b.sdBase=[...S.scores];b.sdProgress=0;b.phase="final";break}
+  }else if(b.turn>=10){b.phase="final";break}
+  b.actual=null;b.declaration="silent";b.phase="choose";
+  break}
+ case"bSudden":b.sudden=true;b.sdProgress=0;b.sdBase=[...S.scores];b.phase="choose";break;
+ }
+}
+// ホストが1つの操作を受け付ける（変わったら true）
+function hostApply(seat,n,x,y,ver){
+ if(typeof n!=="string"||!canDo(seat,n))return false;
+ if(ANYONE.includes(n)&&ver!==undefined&&ver!==S.ver)return false; // 古い画面で押したボタンは無視（2人同時押しで2回進まない）
+ const before=JSON.stringify(S);
+ doAct(seat,n,x===undefined?undefined:String(x),y===undefined?undefined:String(y));
+ if(JSON.stringify(S)===before)return false;
+ S.ver++;return true;
+}
+
+/* ---------- 通信（room の presence だけを使う） ---------- */
+function publish(){
+ if(L.role!=="host"||!L.r)return;
+ ss("dm-online",{code:L.code,role:"host",name:L.name,s:S});
+ L.r.presence({role:"host",gid:L.gid,name:L.name,s:S}).catch(()=>{});
+ render();
+}
+function sendGuest(){
+ if(L.role!=="guest"||!L.r)return;
+ L.r.presence({role:"guest",gid:L.gid,name:L.name,inputs:L.inputs}).catch(()=>{});
+}
+function onPeers(ch){
+ const others=arr(ch.peers).filter(p=>!p.sameTab&&p.kind==="viewer"&&p.presence&&typeof p.presence==="object");
+ if(L.role==="host"){
+  let changed=false;
+  const guests=others.filter(p=>p.presence.role==="guest"&&typeof p.presence.gid==="string");
+  let g=guests.find(p=>p.presence.gid===S.guestGid);
+  if(!g){
+   g=guests.slice().sort((p,q)=>p.presence.gid<q.presence.gid?-1:1)[0];
+   if(g){S.guestGid=g.presence.gid;S.guestApplied=0;changed=true}
+  }
+  L.guestPeer=g||null;
+  if(g){
+   const nm=cleanName(g.presence.name);
+   if(nm!==S.names[1]){S.names[1]=nm;changed=true}
+   const inputs=arr(g.presence.inputs).filter(i=>i&&typeof i.n==="number").sort((p,q)=>p.n-q.n);
+   for(const i of inputs){
+    if(i.n<=S.guestApplied)continue;
+    S.guestApplied=i.n;changed=true;
+    hostApply(1,i.a,i.x,i.y,typeof i.v==="number"?i.v:undefined);
+   }
+  }
+  if(changed){S.ver++;publish()}else render();
+ }else if(L.role==="guest"){
+  const h=others.find(p=>p.presence.role==="host"&&p.presence.s&&typeof p.presence.s==="object"&&p.presence.s.a&&p.presence.s.b);
+  L.hostPeer=h||null;
+  if(h){
+   L.hostLostAt=0;
+   S=h.presence.s;
+   L.spectator=!!S.guestGid&&S.guestGid!==L.gid;
+   me=L.spectator?-1:1;
+   if(L.view==="joining")L.view="game";
+   const keep=L.inputs.filter(i=>!(S.guestGid===L.gid&&i.n<=N(S.guestApplied)));
+   if(keep.length!==L.inputs.length){L.inputs=keep;sendGuest()}
+  }else if(L.view==="game"&&!L.hostLostAt)L.hostLostAt=Date.now();
+  render();
+ }
+}
+async function enterRoom(role,code,restore){
+ if(!L.roomNs)return;
+ L.err="";
+ try{
+  const r=await L.roomNs.join("dm-"+code,role);
+  L.r=r;L.role=role;L.code=code;
+  if(role==="host"){
+   S=restore&&restore.s&&restore.s.a?restore.s:newShared();
+   S.names[0]=L.name;me=0;L.view="game";
+   publish();
+  }else{
+   S=null;me=1;L.view="joining";L.inputs=[];L.n=0;
+   ss("dm-online",{code,role:"guest",name:L.name});
+   sendGuest();
+  }
+  L.unsubs.push(r.onPeers(onPeers,e=>{L.err="通信が切れました（"+esc(e&&e.code)+"）";render()}));
+  render();
+ }catch(e){
+  if((e&&e.code)==="in_use"&&role==="host"&&!restore){enterRoom("host",String(Math.floor(1000+Math.random()*9000)));return}
+  L.err=(e&&e.code)==="not_permitted"?"このアカウントでは部屋に入れませんでした。共有の設定を確認してね":"部屋に入れませんでした。もう一度ためしてね";
+  render(true);
+ }
+}
+async function leaveRoom(){
+ L.unsubs.forEach(u=>{try{u()}catch(_){}});L.unsubs=[];L.lastFx=-1;
+ if(L.r){try{await L.r.leave()}catch(_){}}
+ L.r=null;L.role=null;S=null;me=-1;L.view="lobby";L.guestPeer=null;L.hostPeer=null;L.spectator=false;L.hostLostAt=0;L.inputs=[];
+ ss("dm-online",null);render(true);
+}
+
+/* ---------- ロビー ---------- */
+function renderLobby(){
+ const ready=L.roomState==="ready";
+ const msg=L.roomState==="loading"?`<p class="status"><span class="dots">つなぐ準備をしています</span></p>`:L.roomState==="none"?`<div class="banner">通信の準備ができませんでした。ネットにつながっているか確かめて、ページを開き直してね。</div>`:"";
+ return page(`<div class="spacer"></div><div class="brand">🌐</div><h1>ふたりオンライン対戦</h1><p class="sub">はなれた友だちと、スマホ1台ずつで遊ぼう</p>
+ <div class="card stack"><label>あなたの名前<input class="field" maxlength="16" data-name="1" placeholder="なまえ" value="${esc(L.name)}"></label></div>
+ <div class="card stack"><h3 style="margin:0">部屋を作る</h3><p class="note">作ると4けたのコードが出ます。友だちに教えてね。</p>${button("部屋を作る","create","primary",ready?"":"disabled")}</div>
+ <div class="card stack"><h3 style="margin:0">友だちの部屋に入る</h3><label>部屋コード<input class="field code" inputmode="numeric" maxlength="4" data-code="1" placeholder="0000" value="${esc(L.joinCode)}"></label>${button("部屋に入る","join","",ready?"":"disabled")}</div>
+ ${msg}${L.err?`<div class="banner">${esc(L.err)}</div>`:""}<div class="spacer"></div>`,"center");
+}
+function renderJoining(){
+ return page(`<div class="spacer"></div>${waitCard("🔎",`部屋 ${esc(L.code)} を探しています`)}<p class="note" style="text-align:center">見つからないときは、コードが合っているか、相手が部屋を作ったままか確かめてね。</p>${button("もどる","leave","ghost")}<div class="spacer"></div>`,"center");
+}
+function renderHostWaiting(){
+ return page(`<div class="spacer"></div><div class="card wait"><p class="sub" style="margin:0">部屋コード</p><div class="bigcode">${esc(L.code)}</div><p style="margin:0">友だちにこのページを開いてもらい、<br>このコードを入れてもらってね。</p></div>${waitCard("⏳","相手が入るのを待っています")}${button("部屋を閉じる","leave","ghost")}<div class="spacer"></div>`,"center");
+}
+
+/* ---------- ゲーム選択・ルール ---------- */
+function renderSelect(){
+ return page(`<div class="scorebar"><div class="score p1">${esc(name(0))}${youTag(0)}</div><div class="round">部屋 ${esc(L.code)}</div><div class="score p2" style="text-align:right">${esc(name(1))}${youTag(1)}</div></div><h1>ゲームを選ぼう</h1><p class="note">どちらが押しても決まります。</p>
+ <button class="card" data-act="chooseGame" data-x="A"><h2>🧨 地雷畑の置き土産</h2><p class="sub">罠をよけて、ゴールを目指そう。</p></button>
+ <button class="card" data-act="chooseGame" data-x="B"><h2>🔐 次の手はお見通し</h2><p class="sub">泥棒と警備員、読み合い勝負。</p></button>
+ ${button("部屋を出る","leave","ghost")}`);
+}
+function renderRules(){
+ const a=S.game==="A";
+ return page(`<h1>${a?"🧨 地雷畑の置き土産":"🔐 次の手はお見通し"}</h1><div class="card"><p>${a?"仕掛け役は、相手に見えない罠を4つ置きます。":"泥棒は金庫を1つ選び、狙う金庫を宣言します（ウソでもOK）。"}</p><p>${a?"歩く役は石を2回投げて、罠の場所を探せます。":"警備員は宣言と過去の履歴を見て、守る金庫を選びます。"}</p><p>${a?"段1〜4は各1点、ゴールできたら8点です。":"盗めた金庫の点が泥棒に、捕まえると警備員に入ります。"}</p><p>${a?"役を交代して3回ずつ。合計点で勝負！":"役を交代して5回ずつ。宣言が外れると泥棒は−1点！"}</p><p class="small" style="margin:0">先攻は<b class="p1">${esc(name(0))}</b>さん。相手の秘密は、あなたの画面には出ません。</p></div>${button("ゲームを始める","start","primary")}${button("ゲーム選択へ","select","ghost")}`);
+}
+
+/* ---------- A. 地雷畑 ---------- */
+function roundLabelA(){const a=S.a;return a.sudden?`サドンデス ${N(a.sdProgress)%2+1}/2`:`ラウンド ${Math.min(N(a.completed)+(a.finishedBy?0:1),6)} / 6`}
+function renderASetup(){
+ const t=trapper(),traps=arr(S.a.traps);
+ if(me!==t)return page(`${scorebar(roundLabelA())}${turnFlag(false,`${esc(name(t))}さんが罠を置いています`)}${waitCard("💣",`いま ${traps.length} / 4 こ`)}<p class="note" style="text-align:center">次はあなたが歩く番。どこが危ないか、考えておこう。</p>`);
+ let cells="";
+ for(let y=5;y>=0;y--)for(let x=0;x<5;x++){
+  const placed=traps.some(p=>p.x===x&&p.y===y),rowUsed=traps.some(p=>p.y===y);
+  const allowed=placed||(y>=1&&!rowUsed&&!adjacent(x,y)&&traps.length<4);
+  cells+=`<button class="cell ${y===0?"row0":""} ${y===5?"goal":""} ${allowed?"":"dim"} ${placed?"selected":""}" data-act="cell" data-x="${x}" data-y="${y}" aria-label="段${y}、列${x+1}">${placed?"💣":""}</button>`;
+ }
+ return page(`${scorebar(roundLabelA())}${turnFlag(true,"あなたが仕掛け役！")}<h2>罠を4つ置こう</h2><div class="grid">${cells}</div><div class="gridlabels">いちばん上の段がゴール・いちばん下の段がスタート</div><p class="note">同じ段に1つまで。罠は縦・横・ななめに隣り合えません。もう一度押すと外せます。</p><div class="row"><span class="badge" style="flex:0 0 auto;align-self:center">${traps.length} / 4 こ</span>${button("決定","trapsDone",traps.length===4?"primary":"",traps.length===4?"":"disabled")}</div>`);
+}
+function renderAQuote(){
+ const t=trapper();
+ if(me!==t)return page(`${scorebar(roundLabelA())}${turnFlag(false,`${esc(name(t))}さんがひとことを選んでいます`)}${waitCard("💬","ウソかもしれないので気をつけて")}`);
+ const q=S.a.quote;
+ return page(`${scorebar(roundLabelA())}${turnFlag(true,"歩く人へ、ひとこと（ウソでもOK）")}<div class="options">${quotes.map((s,i)=>`<button class="${q===i?"gold":""}" data-act="quote" data-x="${i}">${esc(s)}</button>`).join("")}</div>${button("決定して相手の番へ","quoteDone",q!==null?"primary":"",q!==null?"":"disabled")}`);
+}
+function walkGrid(interactive,showTraps){
+ const a=S.a,path=arr(a.path).map(p=>({x:N(p.x),y:N(p.y)})),marks=arr(a.marks),traps=arr(a.traps).map(t=>({x:N(t.x),y:N(t.y)}));
+ const at=path[path.length-1]||null,fin=!!a.finishedBy;
+ let out="";
+ for(let y=5;y>=0;y--)for(let x=0;x<5;x++){
+  let enabled=false;
+  if(!fin){
+   if(a.stoneMode)enabled=y>=1&&!path.some(p=>p.y===y)&&!marks.some(m=>N(m.x)===x&&N(m.y)===y);
+   else if(!at)enabled=y===0;
+   else enabled=y===at.y+1&&Math.abs(x-at.x)<=1;
+  }
+  const isTrap=traps.some(t=>t.x===x&&t.y===y),onPath=path.some(p=>p.x===x&&p.y===y),mark=marks.find(m=>N(m.x)===x&&N(m.y)===y);
+  let cls=`cell ${y===0?"row0":""} ${y===5?"goal":""}`;
+  if(enabled&&interactive)cls+=" canmove";
+  if(onPath)cls+=" path";
+  if(fin&&isTrap)cls+=" trap";else if(showTraps&&isTrap&&!onPath&&!mark)cls+=" ghosttrap";
+  const last=at&&at.x===x&&at.y===y;
+  const content=mark?(mark.trap?"💣":"✓"):(fin&&isTrap)?"💣":last?"👣":onPath?"·":(showTraps&&isTrap)?"💣":"";
+  out+=interactive?`<button class="${cls}" data-act="walkCell" data-x="${x}" data-y="${y}">${content}</button>`:`<div class="${cls}">${content}</div>`;
+ }
+ return `<div class="grid">${out}</div><div class="gridlabels">いちばん上の段がゴール・いちばん下の段がスタート</div>`;
+}
+function renderAWalk(){
+ const a=S.a,w=walker(),t=trapper(),mine=me===w,fin=a.finishedBy;
+ const qi=a.quote,quote=qi===8||qi===null?"":quotes[N(qi)]||"";
+ const qbox=quote?`<div class="quote ${t===1?"bluequote":""}"><span class="small">${esc(name(t))}さんのひとこと</span><br>${esc(quote)}</div>`:"";
+ const finBox=fin?`<div class="card stack"><p class="resultword ${fin==="trap"?"lose":"win"}" style="margin:0">${fin==="trap"?"ドカーン！":"ゴール！"}</p>${button("結果を見る","aFinish","primary")}</div>`:"";
+ const path=arr(a.path);
+ let head;
+ if(mine)head=turnFlag(true,"あなたが歩く番！")+`<p class="note">${path.length===0?"いちばん下の段の好きなマスから始めよう。":"光ったマスへ1歩進もう。"} 石はあと${N(a.stones)}回。</p>`;
+ else head=turnFlag(false,`${esc(name(w))}さんが歩いています`)+(me===t?`<p class="note">うすい💣があなたの罠。相手には見えていません。</p>`:"");
+ const tools=mine&&!fin?`<div class="row">${button(a.stoneMode?"投げる場所を選んでね":"🪨 石を投げる","stone",a.stoneMode?"gold":"",N(a.stones)>0?"":"disabled")}${a.stoneMode?button("やめる","stoneCancel","ghost"):""}</div>`:"";
+ return page(`${scorebar(roundLabelA())}${qbox}${head}${finBox}${walkGrid(mine&&!fin,me===t)}${tools}`,fin==="trap"?"shake flash":"");
+}
+function renderAResult(){
+ const a=S.a,w=walker(),t=trapper(),points=a.finishedBy==="goal"?8:N(a.earned);
+ const traps=arr(a.traps),path=arr(a.path);
+ let cells="";
+ for(let y=5;y>=0;y--)for(let x=0;x<5;x++){
+  const trap=traps.some(p=>N(p.x)===x&&N(p.y)===y),onPath=path.some(p=>N(p.x)===x&&N(p.y)===y);
+  cells+=`<div class="cell ${y===0?"row0":""} ${y===5?"goal":""} ${trap?"trap":""} ${onPath?"path":""}">${trap?"💣":onPath?"👣":""}</div>`;
+ }
+ return page(`${scorebar(roundLabelA())}<h2>ラウンド結果</h2><div class="resultword ${a.finishedBy==="trap"?"lose":"win"}">${a.finishedBy==="trap"?"ドカーン！":"ゴール！"}</div><p class="player ${colorClass(t)}" style="margin:0">${esc(name(t))}さんの罠、ぜんぶ見えてた？</p><div class="grid">${cells}</div><p><b class="${colorClass(w)}">${esc(name(w))}</b>さんに <b>${points}点</b>。安全な段1〜4は各1点、ゴールは合計8点。</p>${button("次へ","aNext","primary")}<p class="small" style="text-align:center;margin:0">どちらが押しても進みます</p>`);
+}
+function finalWord(){const w=winner();return `<div class="resultword ${w<0?"win":colorClass(w)}">${w<0?"同点！":w===me?"あなたの勝ち！":`${esc(name(w))}さんの勝ち！`}</div><p class="sub" style="text-align:center">${N(S.scores[0])} 対 ${N(S.scores[1])}</p>`}
+function renderAFinal(){return page(`${scorebar("最終結果")}<div class="spacer"></div>${finalWord()}<div class="spacer"></div>${button("もう一回","replay","primary")}${button("ゲームを選ぶ","select","ghost")}`,"center")}
+function renderASudden(){return page(`${scorebar("サドンデス")}<div class="spacer"></div><h1 class="resultword">同点！</h1><p style="text-align:center">1人ずつ歩いて勝負。まだ同点なら、もう1回！</p><div class="spacer"></div>${button("サドンデス","aSudden","gold")}${button("ゲームを選ぶ","select","ghost")}`,"center")}
+
+/* ---------- B. 泥棒と警備員 ---------- */
+function turnLabelB(){const b=S.b;return b.sudden?`サドンデス ${N(b.sdProgress)%2+1}/2`:`ターン ${Math.min(N(b.turn)+1,10)} / 10`}
+function histText(h){const [d,a,c,p]=arr(h);return `宣言：${esc(declLabel(String(d)))} → 実際：${esc(bankName(String(a)))}の金庫 → ${c?"捕まった":"盗めた"}${p?"・宣言が外れて−1点":""}`}
+function renderBChoose(){
+ const thief=N(S.b.turn)%2;
+ if(me!==thief)return page(`${scorebar(turnLabelB())}${turnFlag(false,`${esc(name(thief))}さんが泥棒。金庫を選んでいます`)}${waitCard("🦹","次はあなたが守る番")}`);
+ return page(`${scorebar(turnLabelB())}${turnFlag(true,"あなたが泥棒！")}<h2>盗む金庫を選ぼう</h2><div class="stack">${banks.map(k=>`<button class="bank" data-act="bank" data-x="${k.id}"><strong>${k.name}の金庫</strong><span>${k.points}点</span></button>`).join("")}</div>`);
+}
+function renderBDeclare(){
+ const thief=N(S.b.turn)%2;
+ if(me!==thief)return page(`${scorebar(turnLabelB())}${turnFlag(false,`${esc(name(thief))}さんが宣言を考えています`)}${waitCard("🗣️","ウソをつくかも…？")}`);
+ const labels=[["small","小を狙う"],["middle","中を狙う"],["large","大を狙う"],["silent","言わない"]];
+ return page(`${scorebar(turnLabelB())}${turnFlag(true,`${esc(bankName(S.b.actual))}の金庫を狙っています`)}<h2>相手に何と宣言する？</h2><p class="note">ウソの宣言はバレたら−1点。「言わない」は罰なし。</p><div class="options">${labels.map(([id,l])=>`<button class="${S.b.declaration===id?"gold":""}" data-act="declare" data-x="${id}">${l}</button>`).join("")}</div>${button("決定して相手の番へ","bDeclareDone","primary")}`);
+}
+function renderBGuard(){
+ const thief=N(S.b.turn)%2,guard=1-thief;
+ const decl=`<div class="quote ${thief===1?"bluequote":""}">${esc(name(thief))}さんの宣言：<b>${esc(declLabel(String(S.b.declaration)))}</b></div>`;
+ if(me!==guard)return page(`${scorebar(turnLabelB())}${turnFlag(false,`${esc(name(guard))}さんが守る金庫を考えています`)}${decl}${me===thief?`<p class="note" style="text-align:center">あなたは<b>${esc(bankName(S.b.actual))}の金庫</b>を狙っています</p>`:""}${waitCard("👮","読まれていないかな…")}`);
+ const hist=arr(S.b.history[thief]);
+ return page(`${scorebar(turnLabelB())}${turnFlag(true,"あなたが警備員！")}${decl}<h3>${esc(name(thief))}さんの過去の履歴</h3><div class="history">${hist.length?hist.map(h=>`<div class="histrow">${histText(h)}</div>`).join(""):'<p class="small">まだ履歴はありません。</p>'}</div><div class="stack">${banks.map(k=>`<button class="bank" data-act="guard" data-x="${k.id}"><strong>${k.name}の金庫を守る</strong><span>${k.points}点</span></button>`).join("")}</div>`);
+}
+function renderBWait(){return page(`${scorebar("結果発表")}<div class="spacer"></div><div class="resultword">🥁</div><h2 style="text-align:center"><span class="dots">ドラムロール</span></h2><div class="spacer"></div>`,"center")}
+function renderBResult(){
+ const r=S.b.pending;if(!r)return renderBWait();
+ const th=N(r.thief),gu=N(r.guard),pts=N(r.points);
+ return page(`${scorebar(turnLabelB())}<h2>結果発表</h2><div class="resultword ${r.caught?"lose":"win"}">${r.caught?"捕まえた！":"盗めた！"}</div><p style="margin:0">${esc(name(th))}さんが狙ったのは：<b>${esc(bankName(String(r.actual)))}の金庫</b></p><p style="margin:0">${esc(name(gu))}さんが守ったのは：<b>${esc(bankName(String(r.guarded)))}の金庫</b></p><div class="card"><p style="margin:0">${r.caught?`${esc(name(gu))}さんに${pts}点。`:`${esc(name(th))}さんに${pts}点。`}</p>${r.penalty?`<p style="margin:6px 0 0">宣言が外れたので、${esc(name(th))}さんに−1点。</p>`:""}</div>${button("次へ","bNext","primary")}<p class="small" style="text-align:center;margin:0">どちらが押しても進みます</p>`);
+}
+function renderBFinal(){
+ const tie=winner()<0;
+ const hist=arr(S.b.history).map((list,i)=>`<h3 class="player ${colorClass(i)}" style="margin:6px 0 0">${esc(name(i))}さんの泥棒履歴</h3><div class="history">${arr(list).length?arr(list).map((h,n)=>`<div class="histrow">${n+1}. ${histText(h)}</div>`).join(""):'<div class="histrow">まだありません。</div>'}</div>`).join("");
+ return page(`${scorebar("最終結果")}${finalWord()}${tie?`<p style="text-align:center;margin:0">サドンデスで勝負しよう。</p>${button("サドンデス","bSudden","gold")}`:""}${hist}${button("もう一回","replay","primary")}${button("ゲームを選ぶ","select","ghost")}`);
+}
+
+/* ---------- 描画 ---------- */
+function render(force){
+ const ae=document.activeElement;
+ if(!force&&L.view==="lobby"&&ae&&ae.tagName==="INPUT"&&app.contains(ae)&&app.querySelector("[data-act=create]")){ // 入力中は描き直さず、ボタンだけ更新
+  const ok=L.roomState==="ready";app.querySelectorAll("[data-act=create],[data-act=join]").forEach(b=>b.disabled=!ok);return;
+ }
+ let html="";
+ try{
+  if(L.view==="lobby")html=renderLobby();
+  else if(L.view==="joining")html=renderJoining();
+  else if(S){
+   if(S.fx&&N(S.fx.n)!==L.lastFx){if(L.lastFx>=0)playFx(String(S.fx.k));L.lastFx=N(S.fx.n)}
+   if(L.role==="host"&&!L.guestPeer&&!S.guestGid)html=renderHostWaiting();
+   else if(S.screen==="select")html=renderSelect();
+   else if(S.screen==="rules")html=renderRules();
+   else if(S.screen==="A"){const p=S.a.phase;html=p==="setup"?renderASetup():p==="quote"?renderAQuote():p==="walk"?renderAWalk():p==="result"?renderAResult():p==="sudden"?renderASudden():renderAFinal()}
+   else if(S.screen==="B"){const p=S.b.phase;html=p==="choose"?renderBChoose():p==="declare"?renderBDeclare():p==="guard"?renderBGuard():p==="wait"?renderBWait():p==="result"?renderBResult():renderBFinal()}
+  }
+  if(!html)html=renderLobby();
+ }catch(e){html=page(`<h2>画面を整えています</h2><p>少し待つか、部屋を出て入り直してね。</p>${button("部屋を出る","leave","ghost")}`)}
+ app.innerHTML=html;
+ if(me===-1&&L.view==="game")app.querySelectorAll("[data-act]:not([data-act=leave])").forEach(b=>b.disabled=true);
+}
+
+/* ---------- 操作 ---------- */
+function myAct(n,x,y){
+ if(!S)return;
+ if(L.role==="host"){if(hostApply(0,n,x,y))publish()}
+ else if(L.role==="guest"&&!L.spectator){
+  if(!canDo(1,n))return; // 自分の番でないボタンは送らない
+  L.inputs.push({n:++L.n,a:n,x:x===undefined?undefined:String(x),y:y===undefined?undefined:String(y),v:S.ver});
+  if(L.inputs.length>30)L.inputs.shift();
+  sendGuest();
+ }
+}
+app.addEventListener("click",e=>{
+ const t=e.target.closest("[data-act]");if(!t||t.disabled)return;
+ sound(520,.05);buzz(10);
+ const d=t.dataset;
+ if(d.act==="create"){
+  if(!L.name){L.err="先に名前を入れてね";render(true);return}
+  enterRoom("host",String(Math.floor(1000+Math.random()*9000)));return;
+ }
+ if(d.act==="join"){
+  if(!L.name){L.err="先に名前を入れてね";render(true);return}
+  if(!/^\d{4}$/.test(L.joinCode)){L.err="4けたのコードを入れてね";render(true);return}
+  enterRoom("guest",L.joinCode);return;
+ }
+ if(d.act==="leave"){leaveRoom();return}
+ myAct(d.act,d.x,d.y);
+});
+app.addEventListener("input",e=>{
+ const el=e.target;
+ if(el.dataset.name){L.name=cleanName(el.value);if(L.err)L.err=""}
+ if(el.dataset.code){el.value=el.value.replace(/\D/g,"").slice(0,4);L.joinCode=el.value}
+});
+app.addEventListener("keydown",e=>{if(e.key==="Enter"&&e.target.dataset&&e.target.dataset.code){e.target.blur();app.querySelector("[data-act=join]")?.click()}});
+app.addEventListener("touchstart",e=>{if(e.touches&&e.touches.length>1)e.preventDefault()},{passive:false});
+document.addEventListener("gesturestart",e=>e.preventDefault());
+setInterval(()=>{if(L.role==="guest"&&L.hostLostAt)render()},3000);
+
+window.__app={get state(){return S},get me(){return me},local:L,act:myAct};
+
+/* ---------- 起動 ---------- */
+render();
+(async()=>{
+ let ns=null;
+ try{ns=window.__testRoom||window.__peerRoom||null}catch(_){ns=null}
+ L.roomNs=ns;L.roomState=ns?"ready":"none";
+ const saved=ss("dm-online");
+ if(ns&&saved&&/^\d{4}$/.test(String(saved.code||""))&&(saved.role==="host"||saved.role==="guest")){
+  L.name=cleanName(saved.name);
+  await enterRoom(saved.role,String(saved.code),saved.role==="host"?saved:null);
+ }else render();
+})();
+})();
+</script>
+
+</body>
+</html>
