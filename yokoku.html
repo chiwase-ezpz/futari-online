@@ -1,0 +1,575 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f1420">
+<title>予告状 試遊版</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Shippori+Mincho:wght@600&family=Zen+Kaku+Gothic+New:wght@400;700&display=swap">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/peerjs/1.5.4/peerjs.min.js"></script>
+<script>
+// PeerJS で claude.ai の room（presence だけ）と同じ形を作る。ホスト＝部屋を作った人。
+window.__peerRoom = {
+  join(name, role) {
+    return new Promise((resolve, reject) => {
+      if (typeof Peer !== "function") { reject({ code: "upstream_error" }); return; }
+      const hostId = "futari-online-" + name;
+      const handlers = [];
+      let myPresence = {};
+      const conns = new Map(); // peer -> {conn, presence}
+      let peer = null, left = false, settled = false, retryTimer = null;
+      const emitPeers = () => {
+        const list = [{ peer: "me", by: null, isMe: true, sameTab: true, kind: "viewer", guest: false, presence: myPresence, updatedAt: Date.now() }];
+        for (const [id, v] of conns) if (v.presence) list.push({ peer: id, by: null, isMe: false, sameTab: false, kind: "viewer", guest: false, presence: v.presence, updatedAt: Date.now() });
+        handlers.forEach(h => { try { h({ peers: list, joined: [], left: [], updated: [] }) } catch (_) {} });
+      };
+      const sendAll = () => { for (const v of conns.values()) { try { if (v.conn.open) v.conn.send({ t: "p", p: myPresence }) } catch (_) {} } };
+      const wire = conn => {
+        conns.set(conn.peer, { conn, presence: null, seen: Date.now() });
+        conn.on("open", () => { try { conn.send({ t: "p", p: myPresence }) } catch (_) {} });
+        conn.on("data", d => {
+          const sv = conns.get(conn.peer); if (sv && sv.conn === conn) sv.seen = Date.now();
+          if (d && d.t === "k") return;
+          if (!d || d.t !== "p" || typeof d.p !== "object" || d.p === null) return;
+          if (JSON.stringify(d.p).length > 8000) return;
+          const v = conns.get(conn.peer); if (v) { v.presence = d.p; emitPeers(); }
+        });
+        const drop = () => { if (conns.get(conn.peer) && conns.get(conn.peer).conn === conn) { conns.delete(conn.peer); emitPeers(); } if (role === "guest" && !left) scheduleGuestConnect(1500); };
+        conn.on("close", drop); conn.on("error", drop);
+      };
+      function scheduleGuestConnect(ms) {
+        clearTimeout(retryTimer);
+        retryTimer = setTimeout(() => {
+          if (left || !peer || peer.destroyed) return;
+          if ([...conns.values()].some(v => v.conn.open)) return;
+          if (peer.disconnected) { try { peer.reconnect() } catch (_) {} }
+          wire(peer.connect(hostId, { reliable: true, serialization: "json" }));
+          scheduleGuestConnect(4000); // つながるまで数秒ごとに試す
+        }, ms);
+      }
+      const api = {
+        name,
+        presence: async patch => { myPresence = Object.assign({}, myPresence, patch); for (const k in patch) if (patch[k] === null) delete myPresence[k]; sendAll(); },
+        onPeers: h => { handlers.push(h); setTimeout(emitPeers, 0); return () => { const i = handlers.indexOf(h); if (i >= 0) handlers.splice(i, 1); }; },
+        emit: async () => {}, on: () => () => {}, peers: () => [], connected: () => !!peer && !peer.disconnected, onConnection: () => () => {},
+        leave: async () => { left = true; clearTimeout(retryTimer); try { peer && peer.destroy() } catch (_) {} }
+      };
+      // 3秒ごとに「いるよ」を送り、10秒聞こえない相手は抜けたことにする
+      const beat = setInterval(() => {
+        if (left) { clearInterval(beat); return; }
+        const now = Date.now();
+        for (const [id, v] of [...conns]) {
+          if (v.conn.open) { try { v.conn.send({ t: "k" }) } catch (_) {} }
+          if (now - v.seen > 10000) { conns.delete(id); try { v.conn.close() } catch (_) {} emitPeers(); if (role === "guest") scheduleGuestConnect(500); }
+        }
+      }, 3000);
+      let tries = 0;
+      const start = () => {
+        peer = role === "host" ? new Peer(hostId, { debug: 0 }) : new Peer({ debug: 0 });
+        peer.on("open", () => {
+          if (!settled) { settled = true; resolve(api); }
+          if (role === "guest") scheduleGuestConnect(0);
+        });
+        peer.on("connection", conn => { if (role === "host") wire(conn); else conn.close(); });
+        peer.on("disconnected", () => { if (!left) setTimeout(() => { try { if (!left && peer.disconnected && !peer.destroyed) peer.reconnect() } catch (_) {} }, 2000); });
+        peer.on("error", err => {
+          const t = err && err.type;
+          if (t === "peer-unavailable") return; // 相手がまだいない（ゲストは再試行が続く）
+          if (t === "unavailable-id" && role === "host") {
+            // 読み込み直した直後は前の自分がまだ名前を持っていることがある
+            try { peer.destroy() } catch (_) {}
+            if (!settled && tries++ < 6) { setTimeout(start, 2500); return; }
+            if (!settled) { settled = true; reject({ code: "in_use" }); }
+            return;
+          }
+          if (!settled) { settled = true; reject({ code: "upstream_error" }); }
+        });
+      };
+      start();
+    });
+  }
+};
+</script>
+</head>
+<body>
+<style>
+:root{
+  --night:#0f1420; --panel:#171e2d; --panel2:#1e2739; --ink:#ece6d8; --sub:#a7afbf; --line:#2c3549;
+  --gold:#e8c271; --guard:#5aa0ff; --thief:#ff6b5e; --fog:rgba(217,221,230,.22); --win:#7fb6d9; --ok:#7fd0a6;
+  --f-head:"Shippori Mincho","Hiragino Mincho ProN","Yu Mincho",serif;
+  --f-body:"Zen Kaku Gothic New","Hiragino Sans","Yu Gothic",system-ui,sans-serif;
+  color-scheme:dark;
+}
+*{box-sizing:border-box}
+html,body{background:var(--night)}
+body{margin:0;color:var(--ink);font-family:var(--f-body);font-size:15px;line-height:1.6;
+  padding-left:max(12px,env(safe-area-inset-left,0px));padding-right:max(12px,env(safe-area-inset-right,0px));padding-block:10px 40px}
+#app{max-width:30rem;margin:0 auto;display:flex;flex-direction:column;gap:12px}
+h1{font-family:var(--f-head);font-size:1.6rem;margin:6px 0 0}
+h2{font-family:var(--f-head);font-size:1.15rem;margin:0}
+p{margin:0}
+.sub{color:var(--sub);font-size:13px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px;display:flex;flex-direction:column;gap:10px}
+input{font:inherit;color:var(--ink);background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:10px;width:100%}
+button{font:inherit;font-weight:700;color:var(--night);background:var(--gold);border:0;border-radius:8px;padding:11px 14px;cursor:pointer}
+button.ghost{background:var(--panel2);color:var(--ink);border:1px solid var(--line)}
+button:disabled{opacity:.4;cursor:default}
+button:focus-visible,.room:focus-visible{outline:2px solid var(--gold);outline-offset:2px}
+.row{display:flex;gap:8px;flex-wrap:wrap}
+.row>*{flex:1 1 auto}
+.err{color:var(--thief);font-size:13px}
+.top{display:flex;justify-content:space-between;align-items:baseline;gap:8px;flex-wrap:wrap}
+.chips{display:flex;gap:6px;flex-wrap:wrap}
+.chip{background:var(--panel2);border:1px solid var(--line);border-radius:999px;padding:2px 10px;font-size:13px;white-space:nowrap}
+.chip b{color:var(--gold);font-variant-numeric:tabular-nums}
+.chip.me{border-color:var(--gold)}
+.letter{background:#efe6d2;color:#2b2118;font-family:var(--f-head);border-radius:4px;padding:10px 12px;font-size:15px;line-height:1.55}
+.letter small{display:block;text-align:right;color:#8a2a1f}
+.status{font-weight:700;color:var(--gold)}
+.board{display:grid;grid-template-columns:repeat(4,1fr);gap:4px;background:#d8d2c4;padding:4px;border-radius:6px;position:relative}
+.room{position:relative;aspect-ratio:1;background:#6e665b;border-radius:2px;display:flex;align-items:center;justify-content:center;flex-direction:column;font-size:11px;color:#e9e2d4;border:0;padding:0;font-weight:400;cursor:default}
+.room .nm{position:absolute;left:4px;top:2px;opacity:.7}
+.room.win::after{content:"窓";position:absolute;right:3px;top:2px;font-size:10px;color:#cfe8f7;background:#3c6f8f;border-radius:3px;padding:0 3px}
+.room.tg{background:#7a6430}
+.room.tg .gem{color:var(--gold);font-size:16px}
+.room.fog::before{content:"";position:absolute;inset:0;background:var(--fog);border-radius:2px;box-shadow:inset 0 0 12px rgba(255,255,255,.35)}
+.room.can{cursor:pointer;box-shadow:inset 0 0 0 3px var(--gold)}
+.room.pick{box-shadow:inset 0 0 0 3px #fff;background:#8a7f6c}
+.room.cam{box-shadow:inset 0 0 0 3px #b48cff}
+.tok{border-radius:50%;width:44%;aspect-ratio:1;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:12px;z-index:1}
+.tok.g{background:var(--guard);color:#08142a}
+.tok.g.ghost{background:transparent;border:2px dashed var(--guard);color:var(--guard)}
+.tok.t{background:var(--thief);color:#2a0a08}
+.toks{display:flex;gap:2px;justify-content:center;width:100%}
+.step{position:absolute;bottom:2px;right:4px;font-size:11px;color:#ffd0c8;font-variant-numeric:tabular-nums}
+.outside{display:flex;gap:8px;align-items:center;justify-content:center;background:var(--panel2);border:1px dashed var(--line);border-radius:8px;padding:8px;font-size:13px}
+.outside.can{cursor:pointer;border:2px solid var(--gold)}
+.outside.fog{background:#2a3142}
+.log{font-size:13px;color:var(--sub);display:flex;flex-direction:column;gap:2px;max-height:9.5em;overflow:auto}
+.log b{color:var(--ink)}
+.res{font-family:var(--f-head);font-size:1.3rem}
+.verify{font-size:13px}
+.verify.ok{color:var(--ok)}.verify.ng{color:var(--thief)}
+table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums}
+td{padding:4px 6px;border-bottom:1px solid var(--line)}
+.opts{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+.opt{background:var(--panel2);color:var(--ink);border:1px solid var(--line);font-weight:400;text-align:left;padding:8px 10px}
+.opt.sel{border:2px solid var(--gold)}
+.opt b{color:var(--gold)}
+details summary{cursor:pointer;color:var(--sub)}
+ul{margin:4px 0;padding-left:1.2em}
+</style>
+<div id="app"></div>
+<script>
+(function(){
+"use strict";
+/* ===== 決まり（企画書 v3 と同じ。数字はここで変える） ===== */
+const N=16, OUT=16, WIN=[0,3,12,15];
+const ADJ=[];for(let i=0;i<=N;i++)ADJ.push([]);
+for(let r=0;r<4;r++)for(let c=0;c<4;c++){const i=r*4+c;[[1,0],[-1,0],[0,1],[0,-1]].forEach(([dc,dr])=>{const cc=c+dc,rr=r+dr;if(cc>=0&&cc<4&&rr>=0&&rr<4)ADJ[i].push(rr*4+cc)})}
+WIN.forEach(w=>{ADJ[w].push(OUT);ADJ[OUT].push(w)});
+const RC=i=>i===OUT?"外":"ABCD"[i%4]+(Math.floor(i/4)+1);
+const TREAS=[{id:5,name:"月の涙"},{id:10,name:"暁の冠"},{id:4,name:"銀の鍵"},{id:11,name:"翠の盃"}];
+const TNAME=id=>{const t=TREAS.find(t=>t.id===id);return t?t.name:RC(id)};
+const DEAD2=[{T:10,pt:3},{T:12,pt:2}];  // 2〜3人
+const DEAD4=[{T:12,pt:3},{T:14,pt:2}];  // 4人（カメラ係がいると探偵が強いので鐘を2回増やす）
+const HAYA=0;          // 早業（2部屋動ける）は計算で強すぎたので使わない。1にすると1夜に1回使える
+const SMOKE=1;         // 煙玉：1夜に1回、警備員に入られても捕まらずに逃げる（居場所はばれる）
+const REENTRY=true;    // 盗む前なら、外へ出て別の窓から入り直せる
+const CAMERA=true;     // 4人のとき、3人目の探偵はカメラ係
+const SHOTS=3;         // カメラは1夜に3回まで（無制限だと探偵が必ず守れる配置が出た）
+const NIGHTS_PER=2;    // 1人が怪盗をやる回数
+const MAXP=4;
+const deadOf=S=>(S&&S.roles&&S.roles.cam)?DEAD4:DEAD2;
+
+/* ===== ルールの計算（全員の画面で同じ結果になる） ===== */
+function steps(pos,guards,stolen,k,tgt){
+  const gs=new Set(guards);let cur=[[pos,stolen]];const seen=new Set([pos+"|"+(stolen?1:0)]);const out=[[pos,stolen]];
+  for(let i=0;i<k;i++){const nx=[];for(const [p,s] of cur){if(p===OUT&&s)continue;for(const q of ADJ[p]){if(gs.has(q))continue;if(q===OUT&&!s&&!REENTRY&&p!==OUT)continue;const ns=s||q===tgt;const key=q+"|"+(ns?1:0);if(!seen.has(key)){seen.add(key);nx.push([q,ns]);out.push([q,ns])}}}cur=nx}
+  return out;
+}
+function belief(S){
+  let B=new Set([OUT]);let stolen=false;
+  for(const e of S.log){
+    if(e.g){if(e.r==="seen"||e.r==="caught"||e.r==="smoke")B=new Set([e.room]);else{for(const x of e.g)B.delete(x);if(e.cam!=null)B.delete(e.cam)}}
+    if(e.mv){
+      if(e.alarm){B=new Set();if(e.haya){for(const [q] of steps(S.tgt,e.g,true,1,S.tgt))if(!e.g.includes(q)&&q!==OUT)B.add(q)}else B.add(S.tgt);stolen=true}
+      else{const nb=new Set();for(const b of B)for(const [q,s] of steps(b,e.g,stolen,e.haya?2:1,S.tgt)){if(e.g.includes(q)||s!==stolen)continue;nb.add(q)}B=nb}
+    }
+  }
+  return B;
+}
+async function sha(t){
+  if(window.crypto&&crypto.subtle){const b=await crypto.subtle.digest("SHA-256",new TextEncoder().encode(t));return [...new Uint8Array(b)].map(x=>x.toString(16).padStart(2,"0")).join("")}
+  let h=2166136261;for(let i=0;i<t.length;i++){h^=t.charCodeAt(i);h=Math.imul(h,16777619)}return "f"+(h>>>0).toString(16);
+}
+const commitText=(salt,night,t,pos)=>salt+":"+night+":"+t+":"+pos;
+async function verifyNight(S,rev){
+  try{
+    const p=rev.path;if(!Array.isArray(p)||p[0]!==OUT)return false;
+    let stolen=false,hy=HAYA,sm=SMOKE;
+    for(const e of S.log){
+      const pos=p[e.t-1];if(pos==null)return false;
+      if(e.g){
+        if(e.r==="caught"){if(!(e.g.includes(pos)&&e.room===pos))return false;if(sm>0&&steps(pos,e.g,stolen,1,S.tgt).some(([q])=>!e.g.includes(q)))return false}
+        else if(e.r==="smoke"){if(!(e.g.includes(pos)&&e.room===pos)||sm<=0)return false;sm--}
+        else if(e.r==="seen"){if(!(e.cam===pos&&e.room===pos))return false}
+        else if(e.g.includes(pos)||(e.cam!=null&&e.cam===pos))return false;
+      }
+      if(e.mv){
+        const np=p[e.t];if(np==null)return false;
+        if(e.haya){if(hy<=0)return false;hy--}
+        const want=stolen||!!e.alarm;
+        const ok=steps(pos,e.g,stolen,e.haya?2:1,S.tgt).some(([q,s])=>q===np&&!e.g.includes(q)&&s===want);
+        if(!ok)return false;
+        if(!!e.esc!==(want&&np===OUT))return false;
+        if(e.alarm&&stolen)return false;
+        if(await sha(commitText(rev.salt,S.night,e.t,np))!==e.h)return false;
+        stolen=want;
+      }
+    }
+    return true;
+  }catch(_){return false}
+}
+
+/* ===== 共有の状態（ホストが持つ） ===== */
+function newS(){return {v:3,ver:0,screen:"wait",players:[],night:0,total:0,thief:null,roles:null,ph:null,tgt:null,T:null,pt:null,guards:[],plan:{},turn:0,log:[],stolen:false,haya:HAYA,smoke:SMOKE,shots:SHOTS,out:null,reveal:null,scores:{},applied:{}}}
+function rolesFor(S){
+  const ps=S.players.map(p=>p.gid),ti=ps.indexOf(S.thief),d=[];
+  for(let k=1;k<ps.length;k++)d.push(ps[(ti+k)%ps.length]);
+  if(d.length===1)return {g:[d[0],d[0]],cam:null};
+  return {g:[d[0],d[1]],cam:(d.length>=3&&CAMERA)?d[2]:null};
+}
+function beginNight(S){
+  S.thief=S.players[S.night%S.players.length].gid;S.roles=rolesFor(S);
+  Object.assign(S,{ph:"notice",tgt:null,T:null,pt:null,guards:[],plan:{},turn:0,log:[],stolen:false,haya:HAYA,smoke:SMOKE,shots:SHOTS,out:null,reveal:null});
+}
+function finishNight(S,w,why){S.out={w,why,cheat:false};if(w==="thief")S.scores[S.thief]=(S.scores[S.thief]||0)+S.pt;S.ph="end"}
+const needPlan=S=>{const n=[0,1];if(S.ph==="det"&&S.roles.cam&&S.shots>0)n.push("cam");return n};
+const planDone=S=>needPlan(S).every(k=>S.plan[k]!=null);
+
+function hostApply(S,gid,x){
+  const isP=S.players.some(p=>p.gid===gid),isThief=S.thief===gid,last=S.log[S.log.length-1];
+  if(x.a==="start"){if(S.screen!=="wait"||gid!==S.players[0].gid||S.players.length<2)return false;S.screen="night";S.night=0;S.total=S.players.length*NIGHTS_PER;S.scores={};S.players.forEach(p=>S.scores[p.gid]=0);beginNight(S);return true}
+  if(!isP||S.screen!=="night")return x.a==="again"&&S.screen==="final"&&isP?(S.screen="wait",true):false;
+  if(x.night!==S.night)return false;
+  switch(x.a){
+    case "notice":{
+      if(S.ph!=="notice"||!isThief)return false;const t=TREAS.find(t=>t.id===x.tgt),d=deadOf(S).find(d=>d.T===x.T);if(!t||!d)return false;
+      S.tgt=t.id;S.T=d.T;S.pt=d.pt;S.ph="place";S.plan={};return true}
+    case "place":case "plan":{
+      if(!((x.a==="place"&&S.ph==="place")||(x.a==="plan"&&S.ph==="det"&&x.t===S.turn)))return false;
+      let ch=false;
+      for(const k of Object.keys(x.g||{})){const gi=+k;if(S.roles.g[gi]!==gid)continue;const to=x.g[k];
+        if(!(Number.isInteger(to)&&to>=0&&to<N&&to!==S.tgt))continue;
+        if(S.ph==="det"&&!(to===S.guards[gi]||ADJ[S.guards[gi]].includes(to)))continue;
+        S.plan[gi]=to;ch=true}
+      if(S.ph==="det"&&S.roles.cam===gid&&S.shots>0&&Number.isInteger(x.cam)&&(x.cam===-1||(x.cam>=0&&x.cam<N&&x.cam!==S.tgt))){S.plan.cam=x.cam;ch=true}
+      const need=S.ph==="place"?[0,1]:needPlan(S);
+      if(need.every(k=>S.plan[k]!=null)){
+        if(S.ph==="place"){S.guards=[S.plan[0],S.plan[1]];S.plan={};S.turn=1;S.ph="det"}
+        else{const cam=(S.roles.cam&&S.plan.cam!=null&&S.plan.cam>=0)?S.plan.cam:null;if(cam!=null)S.shots--;S.guards=[S.plan[0],S.plan[1]];S.log.push({t:S.turn,g:S.guards.slice(),cam,r:null});S.plan={};S.ph="chk"}
+      }
+      return ch}
+    case "chk":{
+      if(S.ph!=="chk"||!isThief||x.t!==S.turn||!last||last.r)return false;
+      if(!["none","seen","caught","smoke"].includes(x.r))return false;
+      if(x.r==="smoke"){if(S.smoke<=0)return false;S.smoke--}
+      last.r=x.r;if(x.r!=="none")last.room=x.room;
+      if(x.r==="caught")finishNight(S,"det","捕まった");else S.ph="thf";return true}
+    case "mv":{
+      if(S.ph!=="thf"||!isThief||x.t!==S.turn||!last)return false;if(x.haya&&S.haya<=0)return false;
+      last.mv=1;last.alarm=!!x.alarm&&!S.stolen;last.haya=!!x.haya;last.esc=!!x.esc;last.h=String(x.h||"").slice(0,80);
+      if(x.haya)S.haya--;if(last.alarm)S.stolen=true;
+      if(last.esc)finishNight(S,"thief","逃げ切った");else if(S.turn>=S.T)finishNight(S,"det","時間切れ");else{S.turn++;S.ph="det"}
+      return true}
+    case "rev":{
+      if(S.ph!=="end"||!isThief||S.reveal)return false;
+      S.reveal={path:(x.path||[]).slice(0,40).map(Number),salt:String(x.salt||"").slice(0,64)};return true}
+    case "next":{
+      if(S.ph!=="end"||!S.reveal)return false;
+      S.night++;if(S.night>=S.total){S.screen="final";S.ph=null}else beginNight(S);return true}
+  }
+  return false;
+}
+
+/* ===== 通信 ===== */
+const ss={get(k){try{return JSON.parse(sessionStorage.getItem(k))}catch(_){return null}},set(k,v){try{sessionStorage.setItem(k,JSON.stringify(v))}catch(_){}}};
+let gid=ss.get("yk-gid");if(!gid){gid=Math.random().toString(36).slice(2,10);ss.set("yk-gid",gid)}
+let S=null;
+const L={ns:null,room:null,role:null,code:null,name:ss.get("yk-name")||"",n:0,inputs:[],err:"",busy:false,draft:{},haya:false,sec:null,answered:"",revealed:"",verified:{},hostName:"",peers:0};
+function myName(){return (L.name||"").trim().slice(0,10)}
+async function publish(){if(!L.room)return;S.ver++;ss.set("yk-host-"+L.code,S);await L.room.presence({role:"host",gid,name:myName(),s:S})}
+async function send(x){
+  if(!S)return;x.night=S.night;
+  if(L.role==="host"){if(hostApply(S,gid,x))await publish();thiefAuto();render();return}
+  x.n=++L.n;L.inputs.push(x);if(L.inputs.length>30)L.inputs.shift();
+  ss.set("yk-guest-"+L.code,{n:L.n});
+  await L.room.presence({role:"guest",gid,name:myName(),inputs:L.inputs});
+}
+function onPeers(ev){
+  const peers=ev.peers||[];L.peers=peers.length;
+  if(L.role==="host"){
+    let ch=false;
+    for(const p of peers){const pr=p.presence||{};if(p.isMe||pr.role!=="guest"||!pr.gid)continue;
+      let pl=S.players.find(q=>q.gid===pr.gid);
+      if(!pl&&S.screen==="wait"&&S.players.length<MAXP&&pr.name){S.players.push({gid:pr.gid,name:String(pr.name).slice(0,10)});ch=true;pl=true}
+      else if(pl&&pr.name&&pl.name!==String(pr.name).slice(0,10)&&S.screen==="wait"){pl.name=String(pr.name).slice(0,10);ch=true}
+      const done=S.applied[pr.gid]||0;
+      for(const x of (pr.inputs||[])){if(!x||typeof x.n!=="number"||x.n<=done)continue;S.applied[pr.gid]=x.n;if(hostApply(S,pr.gid,x))ch=true;else ch=true}
+    }
+    if(ch)publish();
+  }else{
+    const h=peers.find(p=>(p.presence||{}).role==="host"&&p.presence.s);
+    if(h){S=h.presence.s;L.hostName=h.presence.name;const done=S.applied[gid]||0;const before=L.inputs.length;L.inputs=L.inputs.filter(x=>x.n>done);if(L.inputs.length!==before)L.room.presence({role:"guest",gid,name:myName(),inputs:L.inputs})}
+  }
+  thiefAuto();render();
+}
+async function enterRoom(role,code,restore){
+  L.err="";L.busy=true;render();
+  if(!L.ns){L.err="通信の準備ができませんでした。ネットにつながっているか確かめて、ページを開き直してください。";L.busy=false;render();return}
+  try{
+    L.role=role;L.code=code;
+    if(role==="host"){S=(restore&&ss.get("yk-host-"+code))||newS();if(!S.players.length)S.players.push({gid,name:myName()})}
+    else{S=null;const g=ss.get("yk-guest-"+code);L.n=g?g.n:0}
+    L.sec=ss.get("yk-sec-"+code);
+    L.room=await L.ns.join("yk-"+code,role);
+    L.room.onPeers(onPeers);
+    ss.set("yk-last",{role,code});
+    if(role==="host")await publish();else await L.room.presence({role:"guest",gid,name:myName(),inputs:L.inputs});
+  }catch(e){
+    if((e&&e.code)==="in_use"&&role==="host"&&!restore){L.busy=false;return enterRoom("host",String(Math.floor(1000+Math.random()*9000)))}
+    L.err="部屋に入れませんでした。コードを確かめて、もう一度試してください。";L.role=null;L.room=null;S=null;
+  }
+  L.busy=false;render();
+}
+async function leaveRoom(){try{L.room&&await L.room.leave()}catch(_){}L.room=null;L.role=null;S=null;ss.set("yk-last",null);render()}
+
+/* ===== 怪盗の秘密（このスマホの中だけ） ===== */
+function ensureSecret(){
+  if(!S||S.screen!=="night"||S.thief!==gid)return;
+  if(!L.sec||L.sec.night!==S.night||L.sec.ver!==S.total+":"+S.players.length){
+    const a=new Uint8Array(12);(window.crypto||{getRandomValues:x=>x.map(()=>Math.random()*256|0)}).getRandomValues(a);
+    L.sec={night:S.night,ver:S.total+":"+S.players.length,salt:[...a].map(x=>x.toString(16).padStart(2,"0")).join(""),path:[OUT]};
+    ss.set("yk-sec-"+L.code,L.sec);
+  }
+}
+const myPos=()=>L.sec?L.sec.path[L.sec.path.length-1]:OUT;
+function thiefAuto(){
+  if(!S||S.screen!=="night"||S.thief!==gid)return;
+  ensureSecret();
+  const key=S.night+":"+S.turn;const last=S.log[S.log.length-1];
+  if(S.ph==="chk"&&last&&!last.r&&L.answered!==key){
+    L.answered=key;const pos=myPos();
+    let r="none",room=null;
+    if(last.g.includes(pos)){room=pos;r=(S.smoke>0&&steps(pos,last.g,S.stolen,1,S.tgt).some(([q])=>!last.g.includes(q)))?"smoke":"caught"}else if(last.cam!=null&&last.cam===pos){r="seen";room=pos}
+    send({a:"chk",t:S.turn,r,room});
+  }
+  if(S.ph==="end"&&!S.reveal&&L.revealed!==String(S.night)){L.revealed=String(S.night);send({a:"rev",path:L.sec.path,salt:L.sec.salt})}
+}
+async function thiefMove(to,useHaya){
+  const pos=myPos(),last=S.log[S.log.length-1];
+  const opt=steps(pos,last.g,S.stolen,useHaya?2:1,S.tgt).filter(([q])=>!last.g.includes(q));
+  let pick=opt.find(([q,s])=>q===to&&s===S.stolen);   // 盗まずに行けるならそちらを選ぶ
+  if(!S.stolen){const viaT=opt.find(([q,s])=>q===to&&s);if(to===S.tgt||(!pick&&viaT))pick=viaT;}
+  if(!pick)return;
+  const stolenNow=pick[1];
+  L.sec.path.push(to);ss.set("yk-sec-"+L.code,L.sec);
+  const h=await sha(commitText(L.sec.salt,S.night,S.turn,to));
+  L.haya=false;
+  await send({a:"mv",t:S.turn,alarm:stolenNow&&!S.stolen,esc:stolenNow&&to===OUT,haya:!!useHaya,h});
+}
+
+/* ===== 画面 ===== */
+const app=document.getElementById("app");
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const nameOf=g=>{const p=S&&S.players.find(p=>p.gid===g);return p?p.name:"?"};
+let lastHtml="";
+function render(force){const h=view();if(force||h!==lastHtml){lastHtml=h;app.innerHTML=h;const i=app.querySelector("[data-name]");}}
+function view(){
+  if(!L.role)return lobby();
+  if(!S)return `<div class="card"><p>部屋 ${esc(L.code)} につないでいます…</p><p class="sub">ホストのスマホでこのゲームが開いているか確かめてください。</p><button class="ghost" data-act="leave">やめる</button></div>`;
+  if(S.screen==="wait")return waiting();
+  if(S.screen==="final")return finalV();
+  return night();
+}
+function rulesBox(){return `<details><summary>あそびかた</summary><ul>
+<li>美術館は4×4の部屋。四隅の部屋に窓があり、怪盗は窓から出入りします。</li>
+<li>怪盗は予告状で「盗む宝」と「鐘が何回鳴るまでか」を全員に知らせます。早い予告ほど点が高い（2〜3人：10回=3点・12回=2点、4人：12回=3点・14回=2点）。</li>
+<li>鐘1回ごとに、探偵が警備員2人を動かし（隣の部屋へ1つ、またはその場）、そのあと怪盗がこっそり隣の部屋へ1つ動きます。</li>
+<li>警備員が怪盗のいる部屋に入れば捕まえます。警備員は宝の部屋に入れません。怪盗は警備員のいる部屋に入れません。</li>
+<li>怪盗が宝の部屋に入ると警報が鳴り、その瞬間の居場所がばれます。そのあと窓から外へ出れば怪盗の勝ち。</li>
+<li>怪盗は1夜に1回だけ「煙玉」を使えます。警備員に入られても捕まらず、隣の部屋へ逃げます（そのときの居場所はばれます）。</li>
+<li>3人なら探偵は警備員を1人ずつ担当。4人なら3人目の探偵はカメラ係（1夜に3回まで、好きな部屋をのぞける。映れば居場所がばれる）。</li>
+<li>全員が同じ回数ずつ怪盗をやり、盗んだ点の合計で勝負します。</li></ul></details>`}
+function lobby(){
+  return `<h1>予告状</h1><p class="sub">試遊版。2〜4人で、スマホ1台ずつで遊びます。</p>
+  <div class="card"><label class="sub" for="nm">あなたの名前</label><input id="nm" data-name maxlength="10" value="${esc(L.name)}" placeholder="例：あかね">
+  <button data-act="create" ${L.busy?"disabled":""}>部屋を作る</button></div>
+  <div class="card"><label class="sub" for="cd">部屋コード（4けた）</label><input id="cd" data-code inputmode="numeric" maxlength="4" placeholder="1234">
+  <button class="ghost" data-act="join" ${L.busy?"disabled":""}>部屋に入る</button></div>
+  ${L.err?`<p class="err">${esc(L.err)}</p>`:""}${rulesBox()}`;
+}
+function waiting(){
+  const host=S.players[0]&&S.players[0].gid===gid;
+  const inList=S.players.some(p=>p.gid===gid);
+  return `<div class="top"><h1>予告状</h1><span class="chip">部屋コード <b>${esc(L.code)}</b></span></div>
+  <div class="card"><h2>集まった人（${S.players.length}/${MAXP}）</h2>
+  <div class="chips">${S.players.map(p=>`<span class="chip ${p.gid===gid?"me":""}">${esc(p.name)}</span>`).join("")}</div>
+  ${!inList?`<p class="sub">満員か、始まったあとに入ったので見学です。</p>`:""}
+  ${host?`<button data-act="start" ${S.players.length<2?"disabled":""}>はじめる（全員が怪盗を${NIGHTS_PER}回ずつ）</button>`:`<p class="sub">部屋を作った人が始めるのを待っています。</p>`}
+  <p class="sub">部屋コードを友だちに教えて、入ってもらってください。</p></div>
+  ${rulesBox()}<button class="ghost" data-act="leave">部屋を出る</button>`;
+}
+function scoreChips(){return `<div class="chips">${S.players.map(p=>`<span class="chip ${p.gid===gid?"me":""}">${esc(p.name)} <b>${S.scores[p.gid]||0}</b>点</span>`).join("")}</div>`}
+function myGuards(){if(!S.roles)return [];return [0,1].filter(i=>S.roles.g[i]===gid)}
+function logLines(){
+  const out=[];
+  for(const e of S.log){
+    let s=`<b>鐘${e.t}</b>：警備員 → ${e.g.map(RC).join("・")}`;
+    if(e.cam!=null)s+=`／カメラ ${RC(e.cam)}`;
+    if(e.r==="caught")s+="　<b>捕まえた！</b>";else if(e.r==="smoke")s+=`　<b>煙玉！ ${RC(e.room)}にいたが逃げた</b>`;else if(e.r==="seen")s+=`　<b>カメラに映った！（${RC(e.room)}）</b>`;else if(e.r==="none")s+="　だれもいない";
+    if(e.mv){if(e.haya)s+="　<b>早業！</b>";if(e.alarm)s+=`　<b>警報！〈${esc(TNAME(S.tgt))}〉が盗まれた</b>`}
+    out.push(`<div>${s}</div>`);
+  }
+  return out.reverse().join("");
+}
+function night(){
+  const me=gid,isThief=S.thief===me,isP=S.players.some(p=>p.gid===me),mine=myGuards(),isCam=S.roles&&S.roles.cam===me;
+  const B=S.ph&&S.ph!=="notice"?belief(S):new Set();
+  const last=S.log[S.log.length-1];
+  let status="",ctrl="",can=new Set(),canOut=false;
+  const role=isThief?"あなたは怪盗":mine.length===2?"あなたは探偵（警備員2人）":mine.length===1?`あなたは探偵（警備員${mine[0]+1}）`:isCam?"あなたはカメラ係":"見学";
+  if(S.ph==="notice"){
+    if(isThief){
+      const d=L.draft;
+      status="予告状を書いてください";
+      ctrl=`<div class="card"><h2>盗む宝</h2><div class="opts">${TREAS.map(t=>`<button class="opt ${d.tgt===t.id?"sel":""}" data-act="dTgt" data-x="${t.id}">〈${t.name}〉<br><span class="sub">${RC(t.id)}の部屋</span></button>`).join("")}</div>
+      <h2>鐘が何回鳴るまでに</h2><div class="opts">${deadOf(S).map(x=>`<button class="opt ${d.T===x.T?"sel":""}" data-act="dT" data-x="${x.T}">${x.T}回まで <b>${x.pt}点</b></button>`).join("")}</div>
+      <button data-act="notice" ${d.tgt==null||d.T==null?"disabled":""}>予告状を出す</button></div>`;
+    }else status=`${esc(nameOf(S.thief))}が予告状を書いています…`;
+  }else if(S.ph==="place"){
+    const todo=mine.filter(i=>L.draft[i]==null&&S.plan[i]==null);
+    if(mine.length&&mine.some(i=>S.plan[i]==null)){
+      const gi=todo[0];
+      if(gi!=null){status=`警備員${gi+1}を置く部屋を選んでください`;for(let i=0;i<N;i++)if(i!==S.tgt)can.add(i)}
+      else status="これでよければ決定してください";
+      ctrl=`<div class="row"><button data-act="sendPlace" ${todo.length?"disabled":""}>配置を決定</button><button class="ghost" data-act="undo">やり直す</button></div>`;
+    }else status=isThief?"探偵が警備員を配置しています…":"ほかの探偵を待っています…";
+  }else if(S.ph==="det"){
+    const todo=mine.filter(i=>L.draft[i]==null&&S.plan[i]==null);
+    const camTodo=isCam&&S.shots>0&&L.draft.cam==null&&S.plan.cam==null;
+    if((mine.length&&mine.some(i=>S.plan[i]==null))||(isCam&&S.shots>0&&S.plan.cam==null)){
+      if(todo.length){const gi=todo[0],cur=S.guards[gi];status=`警備員${gi+1}の行き先を選んでください（とどまるなら、今の部屋）`;[cur,...ADJ[cur]].forEach(x=>{if(x!==OUT&&x!==S.tgt)can.add(x)})}
+      else if(camTodo){status=`カメラでのぞく部屋を選んでください（残り${S.shots}回）`;for(let i=0;i<N;i++)if(i!==S.tgt)can.add(i)}
+      else status="これでよければ決定してください";
+      ctrl=`<div class="row"><button data-act="sendPlan" ${todo.length||camTodo?"disabled":""}>決定</button><button class="ghost" data-act="undo">やり直す</button>${camTodo?`<button class="ghost" data-act="camSkip">今回はのぞかない</button>`:""}</div>`;
+    }else status=isThief?"探偵が考えています…":"ほかの探偵を待っています…";
+  }else if(S.ph==="chk"){status="確かめています…"}
+  else if(S.ph==="thf"){
+    if(isThief&&last){
+      const pos=myPos();const k=L.haya?2:1;
+      const opt=steps(pos,last.g,S.stolen,k,S.tgt).filter(([q])=>!last.g.includes(q));
+      opt.forEach(([q,s])=>{if(q===OUT){if(S.stolen||s||REENTRY||pos===OUT)canOut=true}else can.add(q)});
+      if(!S.stolen&&!REENTRY&&pos!==OUT)canOut=false;
+      if(pos===OUT&&!S.stolen)canOut=true;
+      status=S.stolen?"窓から逃げてください（光っている部屋へ）":"動く先を選んでください（今の部屋を選ぶと、とどまる）";
+      ctrl=HAYA?`<div class="row">${S.haya>0?`<button class="ghost ${L.haya?"sel":""}" data-act="haya">${L.haya?"早業をやめる":"早業を使う（2部屋）"}</button>`:`<span class="sub">早業は使用済み</span>`}</div>`:"";
+      if(last.r==="smoke")status="煙玉で逃げる！ 警備員のいない隣の部屋へ動いてください";
+    }else status=`${esc(nameOf(S.thief))}が動いています…`;
+  }else if(S.ph==="end"){
+    const o=S.out||{};
+    const v=L.verified[S.night];
+    status="";
+    ctrl=`<div class="card"><p class="res">${o.w==="thief"?`怪盗の勝ち！ ${esc(nameOf(S.thief))} に ${S.pt}点`:`探偵の勝ち（${esc(o.why||"")}）`}</p>
+    ${S.reveal?`<p class="verify ${v===false?"ng":"ok"}">${v===false?"照合が合いません（怪盗の答えと道すじが食いちがっています）":v?"照合OK：怪盗の答えはすべて本当でした":"照合中…"}</p>`:`<p class="sub">怪盗の道すじを待っています…</p>`}
+    <button data-act="next" ${S.reveal?"":"disabled"}>${S.night+1>=S.total?"結果を見る":"次の夜へ"}</button></div>`;
+  }
+  // 盤
+  const showThief=isThief&&L.sec&&S.ph!=="notice";
+  const pos=showThief?myPos():null;
+  const pathStep={};if(S.ph==="end"&&S.reveal)S.reveal.path.forEach((p,i)=>{if(i>0&&p!==OUT)(pathStep[p]=pathStep[p]||[]).push(i)});
+  let cells="";
+  for(let i=0;i<N;i++){
+    const cls=["room"];if(WIN.includes(i))cls.push("win");if(i===S.tgt)cls.push("tg");
+    if(B.has(i)&&S.ph!=="end")cls.push("fog");if(can.has(i))cls.push("can");
+    if(Object.entries(L.draft).some(([k,v])=>v===i&&k!=="tgt"&&k!=="T")&&S.ph!=="thf")cls.push("pick");
+    if(last&&last.cam===i&&S.ph!=="end")cls.push("cam");
+    const toks=[];
+    S.guards.forEach((g,gi)=>{if(g===i)toks.push(`<span class="tok g">警${gi+1}</span>`)});
+    [0,1].forEach(gi=>{if(L.draft[gi]===i&&S.guards[gi]!==i)toks.push(`<span class="tok g ghost">警${gi+1}</span>`)});
+    if(pos===i)toks.push(`<span class="tok t">怪</span>`);
+    cells+=`<button class="${cls.join(" ")}" ${can.has(i)?`data-act="room" data-x="${i}"`:"tabindex=-1"} aria-label="${RC(i)}"><span class="nm">${RC(i)}</span>${i===S.tgt?`<span class="gem">◆</span>`:""}<span class="toks">${toks.join("")}</span>${pathStep[i]?`<span class="step">${pathStep[i].join(",")}</span>`:""}</button>`;
+  }
+  const outCls=["outside"];if(canOut)outCls.push("can");if(B.has(OUT)&&S.ph!=="end")outCls.push("fog");
+  const head=`<div class="top"><h2>夜 ${S.night+1} / ${S.total}</h2><span class="chip">${role}</span></div>${scoreChips()}`;
+  const letter=S.tgt!=null?`<div class="letter">今宵、鐘が${S.T}回鳴るまでに〈${esc(TNAME(S.tgt))}〉をいただく（${S.pt}点）<small>— 怪盗 ${esc(nameOf(S.thief))}</small></div>`:"";
+  const bell=S.turn?`<div class="top"><span class="chip">鐘 <b>${S.turn}</b> / ${S.T}</span>${S.stolen?`<span class="chip" style="color:var(--thief)">警報が鳴った</span>`:""}${HAYA&&S.haya===0?`<span class="chip">早業 使用済み</span>`:""}<span class="chip">煙玉 <b>${S.smoke}</b></span>${S.roles&&S.roles.cam?`<span class="chip">カメラ <b>${S.shots}</b></span>`:""}</div>`:"";
+  const board=S.ph==="notice"?"":`<div class="board">${cells}</div>
+    <div class="${outCls.join(" ")}" ${canOut?`data-act="room" data-x="${OUT}"`:""}>${pos===OUT?`<span class="tok t" style="width:28px">怪</span>`:""}窓の外${B.has(OUT)&&S.ph!=="end"?"（まだ外にいるかも）":""}${canOut?"：ここを押すと外へ":""}</div>
+    <p class="sub">白いもや＝怪盗がいるかもしれない部屋（全員に見えている推理）${S.ph==="end"&&S.reveal?"／数字＝怪盗がその部屋にいた鐘の回":""}</p>`;
+  return `${head}${letter}${bell}${status?`<p class="status">${status}</p>`:""}${board}${ctrl}
+  ${S.log.length?`<div class="card"><h2>記録</h2><div class="log">${logLines()}</div></div>`:""}
+  ${!isP?`<p class="sub">見学中です。</p>`:""}${rulesBox()}<button class="ghost" data-act="leave">部屋を出る</button>`;
+}
+function finalV(){
+  const rank=S.players.slice().sort((a,b)=>(S.scores[b.gid]||0)-(S.scores[a.gid]||0));
+  const top=S.scores[rank[0].gid]||0;const winners=rank.filter(p=>(S.scores[p.gid]||0)===top);
+  const isP=S.players.some(p=>p.gid===gid);
+  return `<h1>結果</h1><div class="card"><p class="res">${winners.length>1?"引き分け":`${esc(winners[0].name)}の勝ち`}</p>
+  <table>${rank.map((p,i)=>`<tr><td>${i+1}</td><td>${esc(p.name)}${p.gid===gid?"（あなた）":""}</td><td style="text-align:right">${S.scores[p.gid]||0}点</td></tr>`).join("")}</table>
+  ${isP?`<button data-act="again">もう一度（待合室へ）</button>`:""}</div><button class="ghost" data-act="leave">部屋を出る</button>`;
+}
+
+/* ===== 操作 ===== */
+app.addEventListener("input",e=>{if(e.target.matches("[data-name]")){L.name=e.target.value;ss.set("yk-name",L.name)}});
+app.addEventListener("click",async e=>{
+  const b=e.target.closest("[data-act]");if(!b)return;const a=b.dataset.act,x=b.dataset.x!=null?+b.dataset.x:null;
+  if(a==="create"||a==="join"){
+    if(!myName()){L.err="先に名前を入れてください。";render(true);return}
+    if(a==="create")return enterRoom("host",String(Math.floor(1000+Math.random()*9000)));
+    const c=(app.querySelector("[data-code]")||{}).value||"";if(!/^\d{4}$/.test(c.trim())){L.err="部屋コードは4けたの数字です。";render(true);return}
+    return enterRoom("guest",c.trim());
+  }
+  if(a==="leave")return leaveRoom();
+  if(a==="start")return send({a:"start"});
+  if(a==="again")return send({a:"again"});
+  if(a==="dTgt"){L.draft.tgt=x;return render()}
+  if(a==="dT"){L.draft.T=x;return render()}
+  if(a==="notice"){const d=L.draft;L.draft={};return send({a:"notice",tgt:d.tgt,T:d.T})}
+  if(a==="undo"){L.draft={};return render()}
+  if(a==="camSkip"){L.draft.cam=-1;return render()}
+  if(a==="haya"){L.haya=!L.haya;return render()}
+  if(a==="room"){
+    if(S.ph==="place"||S.ph==="det"){
+      const mine=myGuards().filter(i=>L.draft[i]==null&&S.plan[i]==null);
+      if(mine.length){L.draft[mine[0]]=x}else if(S.ph==="det"&&S.roles.cam===gid&&L.draft.cam==null)L.draft.cam=x;
+      return render();
+    }
+    if(S.ph==="thf"&&S.thief===gid)return thiefMove(x,L.haya);
+  }
+  if(a==="sendPlace"||a==="sendPlan"){
+    const g={};myGuards().forEach(i=>{if(L.draft[i]!=null)g[i]=L.draft[i]});const cam=L.draft.cam;L.draft={};
+    return send({a:a==="sendPlace"?"place":"plan",t:S.turn,g,cam});
+  }
+  if(a==="next")return send({a:"next"});
+});
+// 夜の終わりの照合（全員の画面で行う）
+setInterval(async()=>{
+  thiefAuto();
+  if(S&&S.screen==="night"&&S.ph==="end"&&S.reveal&&L.verified[S.night]==null){const n=S.night;L.verified[n]=await verifyNight(S,S.reveal);render(true)}
+  if(S&&L.role==="host"&&S.ph==="end"&&S.reveal&&S.out&&!S.out.checked){S.out.checked=true;const ok=await verifyNight(S,S.reveal);if(!ok&&S.out.w==="thief"){S.scores[S.thief]-=S.pt;S.out.w="det";S.out.why="照合が合わず無効"}publish();render()}
+},400);
+
+(async function boot(){
+  try{L.ns=window.__testRoom||window.__peerRoom||null}catch(_){L.ns=null}
+  render(true);
+  const last=ss.get("yk-last");if(last&&last.code&&myName())enterRoom(last.role,last.code,true);
+})();
+window.__app={get state(){return S},get local(){return L},get me(){return gid},verify:verifyNight,belief:belief};
+})();
+</script>
+
+</body>
+</html>
